@@ -2,8 +2,182 @@
 from __future__ import annotations
 
 import json
-from codex_shim.translate import chat_completion_to_response, anthropic_to_response
+from codex_shim.translate import (
+    anthropic_to_response,
+    chat_completion_to_response,
+    responses_to_chat,
+)
 from codex_shim.server import _build_tool_types
+
+
+def test_node_repl_namespace_flattens_child_tools():
+    body = {
+        "model": "ornith",
+        "input": "test",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "mcp__node_repl__",
+                "description": "Node REPL browser namespace.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "js",
+                        "description": "Run JavaScript.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "code": {"type": "string"},
+                                "timeout_ms": {"type": "integer"},
+                            },
+                            "required": ["code"],
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "name": "js_reset",
+                        "description": "Reset the JavaScript kernel.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    out = responses_to_chat(body, "ornith")
+    tools = out["tools"]
+
+    assert [tool["function"]["name"] for tool in tools] == [
+        "mcp__node_repl____tool__js",
+        "mcp__node_repl____tool__js_reset",
+    ]
+
+    js = tools[0]["function"]
+
+    assert js["parameters"]["properties"]["code"]["type"] == "string"
+    assert js["parameters"]["properties"]["timeout_ms"]["type"] == "integer"
+    assert js["parameters"]["required"] == ["code"]
+
+
+def test_node_repl_namespace_without_trailing_separator_also_flattens():
+    body = {
+        "model": "ornith",
+        "input": "test",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "mcp__node_repl",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "js",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "code": {"type": "string"},
+                            },
+                            "required": ["code"],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    out = responses_to_chat(body, "ornith")
+
+    assert out["tools"][0]["function"]["name"] == (
+        "mcp__node_repl__tool__js"
+    )
+
+
+def test_node_repl_flat_call_reconstructs_codex_namespace():
+    payload = {
+        "id": "chatcmpl_test",
+        "choices": [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_browser_1",
+                            "type": "function",
+                            "function": {
+                                "name": "mcp__node_repl____tool__js",
+                                "arguments": '{"code":"1+1"}',
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+
+    out = chat_completion_to_response(payload, "ornith")
+
+    calls = [
+        item
+        for item in out["output"]
+        if item["type"] == "function_call"
+    ]
+
+    assert len(calls) == 1
+
+    call = calls[0]
+
+    assert call["name"] == "js"
+    assert call["namespace"] == "mcp__node_repl__"
+    assert call["arguments"] == '{"code":"1+1"}'
+
+
+def test_node_repl_namespace_survives_next_turn_history():
+    body = {
+        "model": "ornith",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_browser_1",
+                "namespace": "mcp__node_repl__",
+                "name": "js",
+                "arguments": '{"code":"document.title"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_browser_1",
+                "output": '"Example Domain"',
+            },
+        ],
+    }
+
+    out = responses_to_chat(body, "ornith")
+
+    assistant = next(
+        message
+        for message in out["messages"]
+        if message.get("role") == "assistant"
+        and message.get("tool_calls")
+    )
+
+    call = assistant["tool_calls"][0]
+
+    assert call["function"]["name"] == (
+        "mcp__node_repl____tool__js"
+    )
+
+    assert call["function"]["arguments"] == (
+        '{"code":"document.title"}'
+    )
+
+    tool_result = next(
+        message
+        for message in out["messages"]
+        if message.get("role") == "tool"
+    )
+
+    assert tool_result["tool_call_id"] == "call_browser_1"
 
 
 def test_build_tool_types_native_tools():

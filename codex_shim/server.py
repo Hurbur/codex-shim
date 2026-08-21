@@ -51,6 +51,7 @@ from .translate import (
     chat_completion_to_response,
     chat_to_anthropic,
     normalize_responses_usage,
+    _split_flattened_mcp_tool_name,
     responses_to_anthropic,
     responses_to_chat,
     _chat_finish_to_anthropic_stop,
@@ -1526,14 +1527,7 @@ class ResponsesStreamState:
             {
                 "type": "response.output_item.added",
                 "output_index": output_index,
-                "item": {
-                    "id": call_id,
-                    "type": output_type,
-                    "status": "in_progress",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": "",
-                },
+                "item": self._tool_item(state, "in_progress"),
             },
         )
         return state
@@ -1670,15 +1664,33 @@ class ResponsesStreamState:
             ] if self.message_text else [],
         }
 
-    def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
-        return {
+    def _tool_item(
+        self,
+        state: dict[str, Any],
+        status: str,
+    ) -> dict[str, Any]:
+        name = state["name"]
+        response_name = name
+        namespace = None
+
+        mcp_identity = _split_flattened_mcp_tool_name(name)
+
+        if mcp_identity is not None:
+            namespace, response_name = mcp_identity
+
+        item = {
             "id": state["id"],
             "type": state.get("output_type", "function_call"),
             "status": status,
             "call_id": state["call_id"],
-            "name": state["name"],
+            "name": response_name,
             "arguments": state["arguments"],
         }
+
+        if namespace:
+            item["namespace"] = namespace
+
+        return item
 
     def _response(self, status: str, *, final: bool = False) -> dict[str, Any]:
         output: list[dict[str, Any]] = []

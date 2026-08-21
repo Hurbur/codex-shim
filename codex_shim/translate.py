@@ -341,25 +341,40 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
             }
         )
     tool_types = tool_types or {}
+
     for call in message.get("tool_calls") or []:
         fn = call.get("function") or {}
         name = fn.get("name", "")
+
         original_type = tool_types.get(name, "")
         item_type = "function_call"
+
         if original_type == "apply_patch":
             item_type = "custom_tool_call"
         elif original_type.startswith("web_search"):
             item_type = "web_search_call"
-        output.append(
-            {
-                "id": call.get("id", "call_0"),
-                "type": item_type,
-                "status": "completed",
-                "call_id": call.get("id", "call_0"),
-                "name": name,
-                "arguments": fn.get("arguments", ""),
-            }
-        )
+
+        response_name = name
+        namespace = None
+
+        mcp_identity = _split_flattened_mcp_tool_name(name)
+
+        if mcp_identity is not None:
+            namespace, response_name = mcp_identity
+
+        item = {
+            "id": call.get("id", "call_0"),
+            "type": item_type,
+            "status": "completed",
+            "call_id": call.get("id", "call_0"),
+            "name": response_name,
+            "arguments": fn.get("arguments", ""),
+        }
+
+        if namespace:
+            item["namespace"] = namespace
+
+        output.append(item)
     return {
         "id": payload.get("id", "resp_chat"),
         "object": "response",
@@ -488,12 +503,22 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             # message with multiple tool_calls so chat-completions upstreams
             # accept the subsequent tool messages.
             call_id = item.get("call_id") or item.get("id") or "call_0"
+
+            call_name = str(item.get("name") or "")
+            namespace = str(item.get("namespace") or "").strip()
+
+            if namespace and call_name:
+                call_name = _flatten_namespace_tool_name(
+                    namespace,
+                    call_name,
+                )
+
             pending_tool_calls.append(
                 {
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": item.get("name") or "",
+                        "name": call_name,
                         "arguments": item.get("arguments") or "",
                     },
                 }
@@ -810,14 +835,142 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
+_MCP_FLAT_SEPARATOR = "__tool__"
+
+
+def _flatten_namespace_tool_name(namespace: str, child_name: str) -> str:
+    return _sanitize_tool_name(
+        f"{namespace}{_MCP_FLAT_SEPARATOR}{child_name}"
+    )
+
+
+def _split_flattened_mcp_tool_name(name: str) -> tuple[str, str] | None:
+    if not isinstance(name, str):
+        return None
+    if not name.startswith("mcp__"):
+        return None
+    if _MCP_FLAT_SEPARATOR not in name:
+        return None
+
+    namespace, child_name = name.rsplit(_MCP_FLAT_SEPARATOR, 1)
+    if not namespace or not child_name:
+        return None
+
+    return namespace, child_name
+
+
 def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:
     if not isinstance(tools, list):
         return []
-    converted = []
+
+    converted: list[dict[str, Any]] = []
+
     for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        tool_type = str(tool.get("type") or "").strip().lower()
+        namespace = str(tool.get("name") or "").strip()
+
+        # Codex Desktop exposes Browser Use through the node_repl MCP
+        # namespace. Generic Chat-Completions/local-model backends cannot
+        # invoke a namespace directly, so expose each child as a normal,
+        # uniquely named function.
+        #
+        # Codex versions may spell this namespace either as
+        # mcp__node_repl or mcp__node_repl__. Compare canonically here,
+        # but preserve the original exact namespace in the flattened name
+        # so it can be reconstructed exactly on the return path.
+        if (
+            tool_type == "namespace"
+            and namespace.rstrip("_") == "mcp__node_repl"
+        ):
+            children = tool.get("tools")
+
+            if isinstance(children, list):
+                added = False
+
+                for child in children:
+                    if not isinstance(child, dict):
+                        continue
+
+                    fn = child.get("function")
+
+                    if isinstance(fn, dict):
+                        child_name = str(
+                            fn.get("name")
+                            or child.get("name")
+                            or ""
+                        ).strip()
+
+                        child_description = (
+                            fn.get("description")
+                            or child.get("description")
+                            or ""
+                        )
+
+                        parameters = (
+                            fn.get("parameters")
+                            or fn.get("input_schema")
+                            or child.get("parameters")
+                            or child.get("input_schema")
+                        )
+                    else:
+                        child_name = str(
+                            child.get("name") or ""
+                        ).strip()
+
+                        child_description = (
+                            child.get("description") or ""
+                        )
+
+                        parameters = (
+                            child.get("parameters")
+                            or child.get("input_schema")
+                        )
+
+                    if not child_name:
+                        continue
+
+                    namespace_description = (
+                        tool.get("description") or ""
+                    )
+
+                    description = child_description
+
+                    if namespace_description:
+                        if description:
+                            description += "\n\n"
+                        description += namespace_description
+
+                    converted.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": _flatten_namespace_tool_name(
+                                    namespace,
+                                    child_name,
+                                ),
+                                "description": description,
+                                "parameters": parameters
+                                or {
+                                    "type": "object",
+                                    "properties": {},
+                                },
+                            },
+                        }
+                    )
+
+                    added = True
+
+                if added:
+                    continue
+
         function_tool = _responses_tool_to_chat_function(tool)
+
         if function_tool:
             converted.append(function_tool)
+
     return converted
 
 
