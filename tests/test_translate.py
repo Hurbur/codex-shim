@@ -192,6 +192,25 @@ def test_responses_to_chat_preserves_reasoning_and_effort_for_deepseek():
     ]
 
 
+def test_responses_to_chat_hoists_late_system_messages_for_qwen():
+    body = {
+        "model": "slug",
+        "input": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "prior answer"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "rules"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]},
+        ],
+    }
+
+    out = responses_to_chat(body, "qwen3-coder")
+
+    assert out["messages"] == [
+        {"role": "system", "content": "rules"},
+        {"role": "assistant", "content": "prior answer"},
+        {"role": "user", "content": "next"},
+    ]
+
+
 def test_responses_to_chat_sanitizes_and_merges_strict_provider_messages():
     body = {
         "model": "slug",
@@ -474,3 +493,52 @@ def test_anthropic_to_response_normalizes_cache_usage():
             "cache_creation_input_tokens": 2,
         },
     }
+
+def test_responses_to_chat_maps_nested_reasoning_effort_to_ornith_budget():
+    budgets = {
+        "none": 0,
+        "minimal": 1024,
+        "low": 2048,
+        "medium": 6114,
+        "high": 16384,
+        "xhigh": 32768,
+        "max": -1,
+    }
+
+    for effort, expected_budget in budgets.items():
+        out = responses_to_chat(
+            {
+                "input": [],
+                "reasoning": {"effort": effort},
+            },
+            "ornith",
+        )
+
+        assert out["reasoning_effort"] == effort
+        assert out["thinking_budget_tokens"] == expected_budget
+
+
+def test_responses_to_chat_does_not_apply_ornith_budget_to_other_models():
+    out = responses_to_chat(
+        {
+            "input": [],
+            "reasoning": {"effort": "low"},
+        },
+        "deepseek-reasoner",
+    )
+
+    assert out["reasoning_effort"] == "low"
+    assert "thinking_budget_tokens" not in out
+
+
+def test_responses_to_chat_keeps_legacy_top_level_reasoning_effort_for_ornith():
+    out = responses_to_chat(
+        {
+            "input": [],
+            "reasoning_effort": "low",
+        },
+        "ornith",
+    )
+
+    assert out["reasoning_effort"] == "low"
+    assert out["thinking_budget_tokens"] == 2048

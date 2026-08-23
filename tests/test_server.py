@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -25,16 +26,20 @@ from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX
 def auth_present(monkeypatch, tmp_path):
     auth = tmp_path / "auth.json"
     auth.write_text(json.dumps({"tokens": {"access_token": "stub", "account_id": "acct"}}))
+    models_cache = tmp_path / "missing-models-cache.json"
     monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_AUTH", auth)
     monkeypatch.setattr("codex_shim.server.DEFAULT_CODEX_AUTH", auth)
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", models_cache)
     return auth
 
 
 @pytest.fixture
 def auth_missing(monkeypatch, tmp_path):
     missing = tmp_path / "missing-auth.json"
+    models_cache = tmp_path / "missing-models-cache.json"
     monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_AUTH", missing)
     monkeypatch.setattr("codex_shim.server.DEFAULT_CODEX_AUTH", missing)
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", models_cache)
 
 
 def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
@@ -337,6 +342,477 @@ async def test_streaming_openai_chat_response_completed_includes_usage(tmp_path)
 
     await shim_client.close()
     await upstream_client.close()
+
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/v1/responses",
+        "/v1/responses/compact",
+    ],
+)
+async def test_poisoned_function_call_history_is_rejected_before_upstream(
+    tmp_path,
+    endpoint,
+):
+    upstream_requests = 0
+
+    async def chat(request):
+        nonlocal upstream_requests
+        upstream_requests += 1
+        return web.json_response(
+            {
+                "id": "should_not_be_reached",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "unexpected",
+                        }
+                    }
+                ],
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "slug": "ornith",
+                        "model": "ornith",
+                        "displayName": "Ornith",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "local",
+                    }
+                ]
+            }
+        )
+    )
+
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    malformed = json.dumps(
+        {
+            "session_id": 257643,
+            "chars": "",
+        }
+    )[:-1]
+
+    try:
+        resp = await shim_client.post(
+            endpoint,
+            json={
+                "model": "ornith",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_bad",
+                        "name": "write_stdin",
+                        "arguments": malformed,
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_bad",
+                        "output": "Unknown process id",
+                    },
+                ],
+                "stream": True,
+            },
+        )
+
+        assert resp.status == 400
+
+        text = await resp.text()
+        assert "Invalid tool history" in text
+        assert "invalid JSON arguments" in text
+
+        assert upstream_requests == 0
+
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_responses_stream_guard_rejects_eighth_identical_tool_call():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState(
+        "ornith",
+        max_tool_calls=64,
+        max_duplicate_tool_calls=8,
+    )
+
+    arguments = json.dumps(
+        {
+            "session_id": 257643,
+            "chars": "",
+        }
+    )
+
+    for index in range(7):
+        await state.write_chat_delta(
+            downstream,
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": f"call_{index}",
+                                    "function": {
+                                        "name": "write_stdin",
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    assert len(state.tool_calls) == 7
+
+    with pytest.raises(
+        server_module.ToolRunawayDetected,
+        match="8 identical",
+    ):
+        await state.write_chat_delta(
+            downstream,
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 7,
+                                    "id": "call_7",
+                                    "function": {
+                                        "name": "write_stdin",
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+
+async def test_responses_stream_guard_rejects_sixty_fifth_distinct_tool_call():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState(
+        "ornith",
+        max_tool_calls=64,
+        max_duplicate_tool_calls=None,
+    )
+
+    for index in range(64):
+        await state.write_chat_delta(
+            downstream,
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": f"call_{index}",
+                                    "function": {
+                                        "name": "tool",
+                                        "arguments": json.dumps({"n": index}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    assert len(state.tool_calls) == 64
+
+    with pytest.raises(
+        server_module.ToolRunawayDetected,
+        match="64 distinct tool calls",
+    ):
+        await state.write_chat_delta(
+            downstream,
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 64,
+                                    "id": "call_64",
+                                    "function": {
+                                        "name": "tool",
+                                        "arguments": json.dumps({"n": 64}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    assert len(state.tool_calls) == 64
+
+
+async def test_responses_stream_guard_handles_fragmented_duplicate_arguments():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState(
+        "ornith",
+        max_tool_calls=64,
+        max_duplicate_tool_calls=8,
+    )
+
+    fragments = [
+        "{\"session_id\":",
+        "257643,",
+        "\"chars\":\"\"}",
+    ]
+
+    for index in range(7):
+        for fragment_index, fragment in enumerate(fragments):
+            function = {"arguments": fragment}
+            if fragment_index == 0:
+                function["name"] = "write_stdin"
+
+            await state.write_chat_delta(
+                downstream,
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": f"call_{index}",
+                                        "function": function,
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+
+    for fragment_index, fragment in enumerate(fragments):
+        function = {"arguments": fragment}
+        if fragment_index == 0:
+            function["name"] = "write_stdin"
+
+        if fragment_index < len(fragments) - 1:
+            await state.write_chat_delta(
+                downstream,
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 7,
+                                        "id": "call_7",
+                                        "function": function,
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        else:
+            with pytest.raises(
+                server_module.ToolRunawayDetected,
+                match="8 identical",
+            ):
+                await state.write_chat_delta(
+                    downstream,
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 7,
+                                            "id": "call_7",
+                                            "function": function,
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                )
+
+
+async def test_ornith_responses_tool_runaway_emits_failed_and_closes_upstream(
+    tmp_path,
+):
+    writes = []
+
+    async def chat(request):
+        body = await request.json()
+        assert body["model"] == "ornith"
+
+        response = web.StreamResponse(
+            headers={"Content-Type": "text/event-stream"}
+        )
+        await response.prepare(request)
+
+        arguments = json.dumps(
+            {
+                "session_id": 257643,
+                "chars": "",
+            }
+        )
+
+        try:
+            for index in range(20):
+                event = {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": f"call_{index}",
+                                        "function": {
+                                            "name": "write_stdin",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+
+                await response.write(
+                    (
+                        "data: "
+                        + json.dumps(event, separators=(",", ":"))
+                        + "\n\n"
+                    ).encode()
+                )
+                writes.append(index)
+
+                # Pace the mock so the shim consumes the stream incrementally.
+                await asyncio.sleep(0.02)
+
+            await response.write(b"data: [DONE]\n\n")
+            await response.write_eof()
+
+        except Exception:
+            # A peer close may or may not become visible here immediately;
+            # transport-level disconnect timing is not part of this test.
+            pass
+
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "slug": "ornith",
+                        "model": "ornith",
+                        "displayName": "Ornith",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "local",
+                    }
+                ]
+            }
+        )
+    )
+
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "ornith",
+                "input": "test runaway guard",
+                "stream": True,
+            },
+        )
+
+        assert resp.status == 200
+
+        text = await resp.text()
+        events = _sse_events(text)
+
+        failed = [
+            event
+            for event in events
+            if event.get("type") == "response.failed"
+        ]
+        completed = [
+            event
+            for event in events
+            if event.get("type") == "response.completed"
+        ]
+
+        assert len(failed) == 1
+        assert failed[0]["response"]["status"] == "failed"
+        assert "8 identical" in failed[0]["response"]["error"]["message"]
+
+        assert completed == []
+        assert "data: [DONE]" in text
+
+        # The mock must have emitted enough calls for the duplicate breaker
+        # to have actually reached its configured threshold.
+        assert len(writes) >= 8
+
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
 
 
 async def test_streaming_anthropic_response_completed_includes_usage():
@@ -1338,3 +1814,389 @@ async def test_switch_model_requires_slug(tmp_path, auth_missing):
         assert resp.status == 400
     finally:
         await shim_client.close()
+
+@pytest.mark.parametrize(
+    "endpoint,request_body,expected_key,expected_value",
+    [
+        (
+            "/v1/responses",
+            {"model": "ornith", "input": "test", "stream": False},
+            "max_tokens",
+            40960,
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "ornith",
+                "input": "test",
+                "stream": False,
+                "max_output_tokens": 12000,
+            },
+            "max_tokens",
+            12000,
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "ornith",
+                "input": "test",
+                "stream": False,
+                "max_output_tokens": 100000,
+            },
+            "max_tokens",
+            40960,
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "ornith",
+                "input": "test",
+                "stream": False,
+                "max_output_tokens": -1,
+            },
+            "max_tokens",
+            40960,
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "ornith",
+                "input": "test",
+                "stream": False,
+                "max_output_tokens": 0,
+            },
+            "max_tokens",
+            40960,
+        ),
+        (
+            "/v1/responses/compact",
+            {
+                "model": "ornith",
+                "input": "test",
+                "max_output_tokens": 100000,
+            },
+            "max_tokens",
+            40960,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "model": "ornith",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 100000,
+            },
+            "max_tokens",
+            40960,
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "model": "ornith",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_completion_tokens": 100000,
+            },
+            "max_completion_tokens",
+            40960,
+        ),
+        (
+            "/v1/messages",
+            {
+                "model": "ornith",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 100000,
+                "stream": False,
+            },
+            "max_tokens",
+            40960,
+        ),
+    ],
+)
+async def test_ornith_hard_output_cap_all_openai_egress_paths(
+    tmp_path,
+    endpoint,
+    request_body,
+    expected_key,
+    expected_value,
+):
+    received = []
+
+    async def chat(request):
+        received.append(await request.json())
+        return web.json_response(
+            {
+                "id": "chatcmpl-hard-cap",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "ornith",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "slug": "ornith",
+                        "model": "ornith",
+                        "displayName": "Ornith",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "local",
+                        "max_output_tokens": 40960,
+                    }
+                ]
+            }
+        )
+    )
+
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    try:
+        response = await shim_client.post(endpoint, json=request_body)
+
+        assert response.status == 200, await response.text()
+        assert len(received) == 1
+        assert received[0][expected_key] == expected_value
+
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_ornith_hard_output_cap_does_not_clamp_other_models(tmp_path):
+    received = []
+
+    async def chat(request):
+        received.append(await request.json())
+        return web.json_response(
+            {
+                "id": "chatcmpl-other",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "other",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "slug": "other",
+                        "model": "other",
+                        "displayName": "Other",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "local",
+                        "max_output_tokens": 40960,
+                    }
+                ]
+            }
+        )
+    )
+
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    try:
+        response = await shim_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "other",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 100000,
+            },
+        )
+
+        assert response.status == 200, await response.text()
+        assert received[0]["max_tokens"] == 100000
+
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+def _responses_history_with_tool_calls(count: int) -> list[dict]:
+    items = []
+
+    for index in range(count):
+        call_id = f"call_{index}"
+
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "exec_command",
+                "arguments": "{}",
+            }
+        )
+        items.append(
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "ok",
+            }
+        )
+
+    return items
+
+
+def test_count_responses_tool_calls_counts_calls_not_outputs():
+    body = {
+        "input": [
+            {"type": "function_call"},
+            {"type": "custom_tool_call"},
+            {"type": "computer_call"},
+            {"type": "web_search_call"},
+            {"type": "mcp_call"},
+            {"type": "function_call_output"},
+            {"type": "custom_tool_call_output"},
+            {"type": "message"},
+            {"type": "reasoning"},
+        ]
+    }
+
+    assert server_module._count_responses_tool_calls(body) == 5
+
+
+@pytest.mark.parametrize(
+    "model,endpoint,count,expected_status,expected_upstream",
+    [
+        ("ornith", "/v1/responses", 95, 200, 1),
+        ("ornith", "/v1/responses", 96, 200, 1),
+        ("ornith", "/v1/responses", 127, 200, 1),
+        ("ornith", "/v1/responses", 128, 400, 0),
+        ("ornith", "/v1/responses/compact", 128, 200, 1),
+        ("other", "/v1/responses", 128, 200, 1),
+    ],
+)
+async def test_ornith_cross_turn_history_guard(
+    tmp_path,
+    model,
+    endpoint,
+    count,
+    expected_status,
+    expected_upstream,
+):
+    received = []
+
+    async def chat(request):
+        payload = await request.json()
+        received.append(payload)
+
+        return web.json_response(
+            {
+                "id": "chatcmpl-history-guard",
+                "object": "chat.completion",
+                "created": 0,
+                "model": payload.get("model", model),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "slug": "ornith",
+                        "model": "ornith",
+                        "displayName": "Ornith",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "local",
+                        "max_output_tokens": 40960,
+                    },
+                    {
+                        "slug": "other",
+                        "model": "other",
+                        "displayName": "Other",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "local",
+                        "max_output_tokens": 40960,
+                    },
+                ]
+            }
+        )
+    )
+
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    try:
+        response = await shim_client.post(
+            endpoint,
+            json={
+                "model": model,
+                "input": _responses_history_with_tool_calls(count),
+                "stream": False,
+            },
+        )
+
+        text = await response.text()
+
+        assert response.status == expected_status, text
+        assert len(received) == expected_upstream
+
+        if expected_status == 400:
+            assert "agent-loop guard" in text
+            assert "128" in text
+            assert "Compact or start a fresh conversation" in text
+
+    finally:
+        await shim_client.close()
+        await upstream_client.close()

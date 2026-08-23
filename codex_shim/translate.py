@@ -11,6 +11,10 @@ SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
 
 
+class InvalidToolHistory(ValueError):
+    """Raised when Responses history contains malformed historical tool calls."""
+
+
 def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     import base64
 
@@ -27,7 +31,11 @@ def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     return data
 
 
-def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+def responses_to_chat(
+    body: dict[str, Any],
+    upstream_model: str,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
     messages = []
     instructions = body.get("instructions")
     if instructions:
@@ -44,7 +52,10 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
             m["reasoning_content"] = pending_reasoning
             pending_reasoning = None
         messages.append(m)
-    messages = _sanitize_chat_messages(_merge_consecutive_messages(_normalize_chat_roles(messages)))
+    messages = _normalize_chat_roles(messages)
+    if _requires_system_message_hoist(upstream_model):
+        messages = _hoist_system_messages(messages)
+    messages = _sanitize_chat_messages(_merge_consecutive_messages(messages))
 
     chat: dict[str, Any] = {
         "model": upstream_model,
@@ -55,8 +66,38 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
     _copy_if_present(body, chat, "top_p")
     _copy_if_present(body, chat, "max_output_tokens", "max_tokens")
     _copy_if_present(body, chat, "max_tokens")
+    if chat.get("max_tokens") is None and max_tokens is not None:
+        chat["max_tokens"] = int(max_tokens)
     _copy_if_present(body, chat, "parallel_tool_calls")
-    _copy_if_present(body, chat, "reasoning_effort")
+
+    # Codex/Responses sends reasoning effort as:
+    #     reasoning: {"effort": "low"}
+    # Also retain compatibility with top-level reasoning_effort.
+    effort = None
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+    if effort is None:
+        effort = body.get("reasoning_effort")
+
+    if effort is not None:
+        effort = str(effort).lower()
+        chat["reasoning_effort"] = effort
+
+        # Ornith does not natively support graded reasoning_effort, so map
+        # Codex effort levels to llama.cpp per-request thinking budgets.
+        reasoning_budgets = {
+            "none": 0,
+            "minimal": 1024,
+            "low": 2048,
+            "medium": 6114,
+            "high": 16384,
+            "xhigh": 32768,
+            "max": -1,
+        }
+
+        if upstream_model == "ornith" and effort in reasoning_budgets:
+            chat["thinking_budget_tokens"] = reasoning_budgets[effort]
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
     if tools:
@@ -208,7 +249,10 @@ def anthropic_messages_to_chat(body: dict[str, Any], upstream_model: str, max_to
         else:
             messages.append({"role": role, "content": _anthropic_content_to_chat_content(content)})
 
-    messages = _sanitize_chat_messages(_merge_consecutive_messages(_normalize_chat_roles(messages)))
+    messages = _normalize_chat_roles(messages)
+    if _requires_system_message_hoist(upstream_model):
+        messages = _hoist_system_messages(messages)
+    messages = _sanitize_chat_messages(_merge_consecutive_messages(messages))
     chat: dict[str, Any] = {
         "model": upstream_model,
         "messages": messages or [{"role": "user", "content": ""}],
@@ -513,13 +557,39 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                     call_name,
                 )
 
+            arguments = item.get("arguments")
+            if arguments is None:
+                arguments = ""
+
+            display_name = call_name or "<unnamed>"
+
+            if not isinstance(arguments, str):
+                raise InvalidToolHistory(
+                    f"function_call {call_id} ({display_name}) has non-string arguments"
+                )
+
+            # Preserve the shim's existing compatibility behavior: remove
+            # control characters before validating historical function-call
+            # arguments. Structural corruption (such as truncated JSON) still
+            # fails validation below.
+            arguments = _sanitize_string(arguments)
+
+            if arguments.strip():
+                try:
+                    json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise InvalidToolHistory(
+                        f"function_call {call_id} ({display_name}) has invalid JSON "
+                        f"arguments at line {exc.lineno} column {exc.colno}"
+                    ) from exc
+
             pending_tool_calls.append(
                 {
                     "id": call_id,
                     "type": "function",
                     "function": {
                         "name": call_name,
-                        "arguments": item.get("arguments") or "",
+                        "arguments": arguments,
                     },
                 }
             )
@@ -1291,6 +1361,28 @@ def _normalize_chat_roles(messages: list[dict[str, Any]]) -> list[dict[str, Any]
             current["role"] = "system"
         normalized.append(current)
     return normalized
+
+
+def _requires_system_message_hoist(upstream_model: str) -> bool:
+    # Qwen-family chat templates require all system messages to precede
+    # user/assistant/tool turns. Keep this provider-specific so later
+    # developer instructions do not reorder history for DeepSeek or other
+    # OpenAI-compatible models.
+    model = str(upstream_model or "").strip().lower()
+    model = model.rsplit("/", 1)[-1]
+    return model.startswith("qwen")
+
+
+def _hoist_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    system_messages = [
+        message for message in messages
+        if message.get("role") == "system"
+    ]
+    other_messages = [
+        message for message in messages
+        if message.get("role") != "system"
+    ]
+    return system_messages + other_messages
 
 
 def _merge_consecutive_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

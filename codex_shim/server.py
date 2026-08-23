@@ -44,6 +44,7 @@ from .settings import (
 )
 from .translate import (
     SHIM_ENCRYPTED_CONTENT_PREFIX,
+    InvalidToolHistory,
     anthropic_messages_to_chat,
     anthropic_to_chat_response,
     anthropic_to_response,
@@ -61,6 +62,100 @@ from .translate import (
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
+
+
+def _enforce_ornith_output_cap(
+    route: ShimModel,
+    body: dict[str, Any],
+) -> None:
+    """Clamp explicit Ornith output limits to the configured safety ceiling."""
+    if route.slug != "ornith" and route.model != "ornith":
+        return
+
+    cap = route.max_output_tokens
+    if cap is None or cap <= 0:
+        return
+
+    cap = int(cap)
+
+    if (
+        body.get("max_tokens") is None
+        and body.get("max_completion_tokens") is None
+    ):
+        body["max_tokens"] = cap
+        return
+
+    for key in ("max_tokens", "max_completion_tokens"):
+        value = body.get(key)
+
+        if not isinstance(value, int) or isinstance(value, bool):
+            continue
+
+        if value <= 0 or value > cap:
+            print(
+                f"[guard] {route.slug} output cap: {key}={value} -> {cap}",
+                flush=True,
+            )
+            body[key] = cap
+
+
+ORNITH_HISTORY_TOOL_WARN = 96
+ORNITH_HISTORY_TOOL_LIMIT = 128
+
+
+def _count_responses_tool_calls(body: dict[str, Any]) -> int:
+    """Count historical model tool-call items in a Responses request."""
+    value = body.get("input")
+    if not isinstance(value, list):
+        return 0
+
+    count = 0
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = str(item.get("type") or "")
+
+        # Covers function_call, custom_tool_call, computer_call,
+        # web_search_call, mcp_call, and future *_call item types.
+        # Call-output items do not match because they end in _call_output.
+        if item_type == "function_call" or item_type.endswith("_call"):
+            count += 1
+
+    return count
+
+
+def _enforce_ornith_history_tool_limit(
+    route: ShimModel,
+    body: dict[str, Any],
+) -> None:
+    """Stop cross-turn Ornith agent loops before another inference starts."""
+    if route.slug != "ornith" and route.model != "ornith":
+        return
+
+    count = _count_responses_tool_calls(body)
+
+    if count >= ORNITH_HISTORY_TOOL_LIMIT:
+        print(
+            f"[guard] {route.slug} historical tool-call limit: "
+            f"{count}/{ORNITH_HISTORY_TOOL_LIMIT}; rejecting before inference",
+            flush=True,
+        )
+        raise web.HTTPBadRequest(
+            text=(
+                "Ornith agent-loop guard: conversation contains "
+                f"{count} historical tool calls "
+                f"(limit {ORNITH_HISTORY_TOOL_LIMIT}). "
+                "Compact or start a fresh conversation before continuing."
+            )
+        )
+
+    if count >= ORNITH_HISTORY_TOOL_WARN:
+        print(
+            f"[guard] {route.slug} historical tool-call warning: "
+            f"{count}/{ORNITH_HISTORY_TOOL_LIMIT}",
+            flush=True,
+        )
 
 
 class ShimServer:
@@ -218,6 +313,13 @@ class ShimServer:
         if route.is_openai_chat:
             forwarded = dict(body)
             forwarded["model"] = route.model
+            if (
+                forwarded.get("max_tokens") is None
+                and forwarded.get("max_completion_tokens") is None
+                and route.max_output_tokens is not None
+            ):
+                forwarded["max_tokens"] = int(route.max_output_tokens)
+
             if "messages" in forwarded:
                 forwarded["messages"] = _normalize_roles(forwarded["messages"])
             return await self._post_openai_chat(request, route, forwarded, as_responses=False)
@@ -262,12 +364,20 @@ class ShimServer:
         if self._needs_image_gen(body) or self._needs_image_followup(body):
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = self._route(body)
-        if route.is_openai_chat:
-            forwarded = responses_to_chat(body, route.model)
-            return await self._post_openai_chat(request, route, forwarded, as_responses=True)
-        if route.is_anthropic:
-            forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
-            return await self._post_anthropic(request, route, forwarded, as_responses=True)
+        _enforce_ornith_history_tool_limit(route, body)
+
+        try:
+            if route.is_openai_chat:
+                forwarded = responses_to_chat(body, route.model, route.max_output_tokens)
+                return await self._post_openai_chat(request, route, forwarded, as_responses=True)
+            if route.is_anthropic:
+                forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
+                return await self._post_anthropic(request, route, forwarded, as_responses=True)
+        except InvalidToolHistory as exc:
+            raise web.HTTPBadRequest(
+                text=f"Invalid tool history: {exc}"
+            ) from exc
+
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
     async def responses_compact(self, request: web.Request) -> web.StreamResponse:
@@ -294,16 +404,23 @@ class ShimServer:
             )
         route = self._route(body)
         compact_body = _compact_request_body(body, route.model)
-        if route.is_openai_chat:
-            forwarded = responses_to_chat(compact_body, route.model)
-            forwarded["stream"] = False
-            response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
-            return await _as_compact_response(response, route.slug)
-        if route.is_anthropic:
-            forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
-            forwarded["stream"] = False
-            response = await self._post_anthropic(request, route, forwarded, as_responses=True)
-            return await _as_compact_response(response, route.slug)
+
+        try:
+            if route.is_openai_chat:
+                forwarded = responses_to_chat(compact_body, route.model, route.max_output_tokens)
+                forwarded["stream"] = False
+                response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
+                return await _as_compact_response(response, route.slug)
+            if route.is_anthropic:
+                forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
+                forwarded["stream"] = False
+                response = await self._post_anthropic(request, route, forwarded, as_responses=True)
+                return await _as_compact_response(response, route.slug)
+        except InvalidToolHistory as exc:
+            raise web.HTTPBadRequest(
+                text=f"Invalid tool history: {exc}"
+            ) from exc
+
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
     def _needs_image_gen(self, body: dict[str, Any]) -> bool:
@@ -751,6 +868,7 @@ class ShimServer:
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
     ) -> web.StreamResponse:
+        _enforce_ornith_output_cap(route, body)
         url = _join_url(route.base_url, "/chat/completions")
         headers = _openai_headers(route)
         _dump_debug_request(route.slug, url, body)
@@ -771,6 +889,7 @@ class ShimServer:
     async def _post_openai_chat_as_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any]
     ) -> web.StreamResponse:
+        _enforce_ornith_output_cap(route, body)
         url = _join_url(route.base_url, "/chat/completions")
         headers = _openai_headers(route)
         _dump_debug_request(route.slug, url, body)
@@ -825,7 +944,17 @@ class ShimServer:
         await response.prepare(request)
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
-            state = ResponsesStreamState(route.slug, tool_types)
+
+            if route.slug == "ornith" or route.model == "ornith":
+                state = ResponsesStreamState(
+                    route.slug,
+                    tool_types,
+                    max_tool_calls=64,
+                    max_duplicate_tool_calls=8,
+                )
+            else:
+                state = ResponsesStreamState(route.slug, tool_types)
+
         try:
             if as_responses:
                 await state.start(response)
@@ -844,10 +973,24 @@ class ShimServer:
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
+        except ToolRunawayDetected as exc:
+            upstream.close()
+            print(
+                f"[guard] {route.slug} tool runaway: {exc}",
+                flush=True,
+            )
+
+            if as_responses:
+                try:
+                    await state.fail(response, str(exc))
+                except ClientDisconnected:
+                    pass
+
         except ClientDisconnected:
             pass
         finally:
             upstream.release()
+
         try:
             await response.write_eof()
         except Exception:
@@ -1210,6 +1353,10 @@ class AnthropicMessagesStreamState:
         state["closed"] = True
 
 
+class ToolRunawayDetected(Exception):
+    """Raised when a model produces a pathological tool-call stream."""
+
+
 class ResponsesStreamState:
     """Translates upstream chat-completions / anthropic stream events into the
     Codex Desktop Responses-API event sequence. Keeps the message item and
@@ -1217,7 +1364,14 @@ class ResponsesStreamState:
     proper .added / .delta / .done / .completed events plus a final
     `response.completed` with the full reconciled `output` array."""
 
-    def __init__(self, model: str, tool_types: dict[str, str] | None = None):
+    def __init__(
+        self,
+        model: str,
+        tool_types: dict[str, str] | None = None,
+        *,
+        max_tool_calls: int | None = None,
+        max_duplicate_tool_calls: int | None = None,
+    ):
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
         self.model = model
@@ -1229,6 +1383,9 @@ class ResponsesStreamState:
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
+        self.max_tool_calls = max_tool_calls
+        self.max_duplicate_tool_calls = max_duplicate_tool_calls
+        self.tool_call_fingerprints: dict[tuple[str, str], int] = {}
         # Map sanitized tool name -> original Responses tool type so we can
         # emit the correct output item type (e.g. custom_tool_call for freeform
         # apply_patch instead of generic function_call).
@@ -1251,6 +1408,21 @@ class ResponsesStreamState:
                 await self._close_tool(response, state)
         await _write_sse(response, {"type": "response.completed", "response": self._response("completed", final=True)})
         await response.write(b"data: [DONE]\n\n")
+
+    async def fail(self, response: web.StreamResponse, message: str) -> None:
+        payload = self._response("failed")
+        payload["error"] = {
+            "code": "server_error",
+            "message": message,
+        }
+        await _write_sse(
+            response,
+            {
+                "type": "response.failed",
+                "response": payload,
+            },
+        )
+        await _safe_write(response, b"data: [DONE]\n\n")
 
     # ------------------------------------------------------------------
     # Chat-completions (OpenAI-style) deltas
@@ -1294,8 +1466,22 @@ class ResponsesStreamState:
         fn = call.get("function") or {}
         state = self.tool_calls.get(index)
         if state is None:
+            if (
+                self.max_tool_calls is not None
+                and len(self.tool_calls) >= self.max_tool_calls
+            ):
+                raise ToolRunawayDetected(
+                    f"Local safety guard stopped the response after "
+                    f"{self.max_tool_calls} distinct tool calls."
+                )
+
             call_id = call.get("id") or f"call_{index}"
-            state = await self._open_tool(response, key=index, call_id=call_id, name=fn.get("name") or "")
+            state = await self._open_tool(
+                response,
+                key=index,
+                call_id=call_id,
+                name=fn.get("name") or "",
+            )
         else:
             if fn.get("name"):
                 state["name"] += fn["name"]
@@ -1310,6 +1496,45 @@ class ResponsesStreamState:
                     "output_index": state["output_index"],
                     "delta": arg_delta,
                 },
+            )
+
+        self._check_duplicate_tool_call(state)
+
+    def _check_duplicate_tool_call(self, state: dict[str, Any]) -> None:
+        if self.max_duplicate_tool_calls is None:
+            return
+
+        if state.get("fingerprinted"):
+            return
+
+        name = str(state.get("name") or "")
+        arguments = str(state.get("arguments") or "")
+
+        if not name or not arguments:
+            return
+
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return
+
+        normalized = json.dumps(
+            parsed,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+        fingerprint = (name, normalized)
+        state["fingerprinted"] = True
+
+        count = self.tool_call_fingerprints.get(fingerprint, 0) + 1
+        self.tool_call_fingerprints[fingerprint] = count
+
+        if count >= self.max_duplicate_tool_calls:
+            raise ToolRunawayDetected(
+                f"Local safety guard stopped {count} identical "
+                f"{name} tool calls in one response."
             )
 
     # ------------------------------------------------------------------
