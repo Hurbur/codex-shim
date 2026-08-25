@@ -416,3 +416,59 @@ Remaining limitations include:
 - failed-transition recovery under queued demand has not yet been characterized;
 - a fresh logout/reboot zero-model startup validation remains outstanding;
 - this bootstrap mechanism is evidence for later ValKhana design, not the final ValKhana runtime architecture.
+
+## Fresh reboot zero-model validation
+
+A full CachyOS reboot/login validation was completed after the runtime-switching and request-lease checkpoints.
+
+Pre-reboot state:
+
+- repository HEAD matched `origin/main`;
+- shim was enabled and active;
+- 35B service was disabled and inactive;
+- 9B service was static and inactive;
+- port 8080 was empty;
+- shim health was successful.
+
+Post-reboot validation was performed before opening Work/Codex or sending any local-model request.
+
+Observed after approximately two minutes of uptime:
+
+- `codex-shim.service`: active;
+- `ornith-llama.service`: inactive;
+- `ornith-9b.service`: inactive;
+- shim enablement remained `enabled`;
+- 35B enablement remained `disabled`;
+- 9B remained `static`;
+- port 8765 was listening;
+- port 8080 remained empty;
+- shim `/health` returned `ok: true`;
+- NVIDIA VRAM usage was approximately 111 MiB with only normal desktop/compositor activity visible;
+- no local model was resident in VRAM.
+
+The boot journal contained the shim startup event but no Ornith llama.cpp model-start or model-load event.
+
+This empirically confirms the intended zero-model-at-login policy: the compatibility shim starts automatically after login, while local inference runtimes remain unloaded until an actual model request requires one.
+
+## Runtime-switching bootstrap freeze
+
+The runtime-switching bootstrap phase is considered complete at this checkpoint.
+
+The following behaviors have been empirically validated:
+
+- zero-model cold start;
+- 9B to 35B switching;
+- 35B to 9B switching;
+- same-model no-op behavior;
+- real Work/Codex-triggered switching;
+- zero-model idle operation;
+- pytest isolation from real model services;
+- protection of active non-streaming inference during cross-model demand;
+- protection of active streaming inference during cross-model demand;
+- clean queued transition after the active request completes;
+- fresh reboot/login with the shim available and both model runtimes unloaded.
+
+Do not extend this bootstrap switcher merely to anticipate future requirements. Reopen it only when a later experiment exposes a concrete missing behavior or failure.
+
+These findings are research evidence for later ValKhana design and are not themselves the final ValKhana runtime architecture.
+
