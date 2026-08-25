@@ -1364,13 +1364,13 @@ def _normalize_chat_roles(messages: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def _requires_system_message_hoist(upstream_model: str) -> bool:
-    # Qwen-family chat templates require all system messages to precede
-    # user/assistant/tool turns. Keep this provider-specific so later
+    # Qwen-family and Ornith chat templates require all system messages to
+    # precede user/assistant/tool turns. Keep this provider-specific so later
     # developer instructions do not reorder history for DeepSeek or other
     # OpenAI-compatible models.
     model = str(upstream_model or "").strip().lower()
     model = model.rsplit("/", 1)[-1]
-    return model.startswith("qwen")
+    return model.startswith("qwen") or model.startswith("ornith")
 
 
 def _hoist_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

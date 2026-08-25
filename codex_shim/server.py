@@ -24,6 +24,7 @@ from .cursor_passthrough import (
 )
 from . import router as router_module
 from .hostguard import build_allowed_hosts, host_guard_middleware
+from .local_runtime import LocalRuntimeError, ensure_local_runtime
 from .settings import (
     CHATGPT_MODEL_SLUG,
     DEFAULT_CODEX_AUTH,
@@ -868,6 +869,16 @@ class ShimServer:
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
     ) -> web.StreamResponse:
+        try:
+            runtime_alias = await ensure_local_runtime(route.slug)
+        except LocalRuntimeError as exc:
+            raise web.HTTPServiceUnavailable(
+                text=f"Local model switch failed: {exc}"
+            ) from exc
+
+        if runtime_alias is not None:
+            body["model"] = runtime_alias
+
         _enforce_ornith_output_cap(route, body)
         url = _join_url(route.base_url, "/chat/completions")
         headers = _openai_headers(route)
@@ -889,6 +900,16 @@ class ShimServer:
     async def _post_openai_chat_as_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any]
     ) -> web.StreamResponse:
+        try:
+            runtime_alias = await ensure_local_runtime(route.slug)
+        except LocalRuntimeError as exc:
+            raise web.HTTPServiceUnavailable(
+                text=f"Local model switch failed: {exc}"
+            ) from exc
+
+        if runtime_alias is not None:
+            body["model"] = runtime_alias
+
         _enforce_ornith_output_cap(route, body)
         url = _join_url(route.base_url, "/chat/completions")
         headers = _openai_headers(route)

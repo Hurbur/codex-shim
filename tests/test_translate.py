@@ -211,6 +211,101 @@ def test_responses_to_chat_hoists_late_system_messages_for_qwen():
     ]
 
 
+
+def test_responses_to_chat_hoists_late_system_messages_for_ornith():
+    body = {
+        "model": "ornith",
+        "instructions": "base rules",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "first"}],
+            },
+            {
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "first thought"}
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "first answer"}],
+            },
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<model_switch>first switch</model_switch>",
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "second"}],
+            },
+            {
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "second thought"}
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "second answer"}],
+            },
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<model_switch>second switch</model_switch>",
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "third"}],
+            },
+        ],
+    }
+
+    out = responses_to_chat(body, "ornith")
+
+    assert [message["role"] for message in out["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+
+    assert out["messages"][0]["content"] == (
+        "base rules\n\n"
+        "<model_switch>first switch</model_switch>\n\n"
+        "<model_switch>second switch</model_switch>"
+    )
+
+    assert out["messages"][2]["content"] == "first answer"
+    assert out["messages"][2]["reasoning_content"] == "first thought"
+
+    assert out["messages"][4]["content"] == "second answer"
+    assert out["messages"][4]["reasoning_content"] == "second thought"
+
+    assert all(
+        message["role"] != "system"
+        for message in out["messages"][1:]
+    )
+
+
 def test_responses_to_chat_sanitizes_and_merges_strict_provider_messages():
     body = {
         "model": "slug",
