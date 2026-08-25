@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import pytest
 
 
@@ -21,8 +23,9 @@ def _disable_cursor_passthrough_by_default(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _isolate_local_runtime_from_real_systemd(monkeypatch):
-    async def _noop_runtime_switch(_slug: str):
-        return None
+    @asynccontextmanager
+    async def _noop_runtime_request(_slug: str):
+        yield None
 
     async def _forbid_real_systemctl(*_args: str):
         raise AssertionError(
@@ -32,8 +35,8 @@ def _isolate_local_runtime_from_real_systemd(monkeypatch):
     # server.py imports ensure_local_runtime directly, so patch the symbol
     # actually awaited by ShimServer request handlers.
     monkeypatch.setattr(
-        "codex_shim.server.ensure_local_runtime",
-        _noop_runtime_switch,
+        "codex_shim.server.local_runtime_request",
+        _noop_runtime_request,
     )
 
     # Defense in depth: if a test reaches local_runtime.py directly without

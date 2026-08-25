@@ -293,3 +293,126 @@ Future validation can include:
 - additional model slots
 - stronger runtime identity metadata
 - eventual translation of the findings into ValKhana design requirements
+
+## Cross-model in-flight concurrency
+
+### Destructive-switch failure discovered
+
+A controlled overlap test exposed a real failure in the original switcher.
+
+Test sequence:
+
+- Ornith 1.5 9B was actively serving a long inference.
+- A request for Ornith 1.0 35B arrived while the 9B request was still in flight.
+- The original `_switch_lock` serialized the runtime transition itself, but did not protect the lifetime of the active inference.
+- The switcher immediately requested that systemd stop `ornith-9b.service`.
+
+Observed result:
+
+- systemd sent the configured SIGINT.
+- llama.cpp entered cleanup while an inference was still active.
+- shutdown did not finish within `TimeoutStopSec=30`.
+- systemd sent SIGKILL after 30 seconds.
+- the active 9B request failed with HTTP 500.
+- the shim traceback ended in `aiohttp.client_exceptions.ServerDisconnectedError: Server disconnected`.
+- `ornith-9b.service` ended in `Result=timeout`, `ExecMainStatus=9`, and failed state.
+- the requested 35B transition eventually succeeded, but reported `swap_seconds=33.70`.
+
+This proves that a switch lock alone does not provide inference ownership. A model must not be evicted while an active request is still using it.
+
+### Exclusive local-runtime request lease
+
+The bootstrap switcher was updated with an exclusive local-runtime request lease.
+
+For local model routes:
+
+1. acquire the local request lease;
+2. ensure or switch to the requested runtime;
+3. keep the lease for the entire upstream inference;
+4. for streaming traffic, keep the lease until the stream helper returns and the upstream response is released;
+5. release the lease only after the request is finished.
+
+A request for another local runtime therefore waits instead of stopping the model underneath an active inference.
+
+Non-local routes bypass this local-runtime lease.
+
+This is intentionally conservative. The tested llama.cpp services currently use `-np 1`, so serializing local inference provides a safe bootstrap baseline. It is not a claim that this is the final ValKhana concurrency architecture.
+
+### Mocked regression coverage
+
+A dedicated concurrency regression test verifies that:
+
+- request A acquires the local runtime lease;
+- request B begins while A still owns the lease;
+- request B cannot invoke `ensure_local_runtime()` while A is active;
+- after A releases the lease, B proceeds.
+
+Dedicated local-runtime suite after the change:
+
+- 8 passed.
+
+Full shim suite after the change:
+
+- 222 passed.
+
+The pytest isolation fixture continues to prevent the test suite from starting or stopping real local model services.
+
+### Real non-streaming overlap validation
+
+Real runtime test:
+
+- Request A: Ornith 1.5 9B, non-streaming, long generation.
+- Request B: Ornith 1.0 35B, submitted approximately 3 seconds after A began.
+
+Observed:
+
+- A remained active while B waited.
+- B did not stop 9B while A owned the lease.
+- A completed with HTTP 200 in approximately 15.09 seconds.
+- only after A completed did the switch from 9B to 35B begin.
+- 9B stopped cleanly.
+- 35B became ready with `swap_seconds=3.81`.
+- B completed with HTTP 200 in approximately 19.32 seconds.
+- no SIGKILL, shutdown timeout, service failure, or upstream disconnect occurred.
+
+### Real streaming overlap validation
+
+Real streaming test:
+
+- Request A: Ornith 1.5 9B with `stream=true`.
+- Request B: Ornith 1.0 35B with `stream=true`, submitted approximately 3 seconds after A began.
+
+Observed:
+
+- A remained active while B waited.
+- A completed with HTTP 200 in approximately 23.64 seconds.
+- A emitted `response.completed`.
+- the 9B llama.cpp slot released before the switch started.
+- 9B then stopped cleanly.
+- 35B became ready with `swap_seconds=3.28`.
+- B completed with HTTP 200 in approximately 26.20 seconds.
+- B emitted `response.completed` and returned the expected final text.
+- no `ServerDisconnectedError`, SIGKILL, stop timeout, or failed service state occurred.
+
+### Bootstrap conclusion
+
+The exclusive request lease fixes the destructive cross-model in-flight eviction demonstrated by the original switcher.
+
+Current proven behavior is:
+
+- cold model loading works;
+- same-model requests avoid unnecessary swaps;
+- model-to-model switching works;
+- zero-model idle startup works;
+- active local inference is protected from cross-model eviction;
+- waiting cross-model requests resume after the current inference completes;
+- the protection holds for both non-streaming and streaming traffic.
+
+Remaining limitations include:
+
+- the lease is process-local;
+- all current local model requests are serialized rather than supporting multiple concurrent inference slots;
+- queue fairness and cancellation behavior have not yet been characterized;
+- failed-transition recovery under queued demand has not yet been characterized;
+- a fresh logout/reboot zero-model startup validation remains outstanding;
+- this bootstrap mechanism is evidence for later ValKhana design, not the final ValKhana runtime architecture.

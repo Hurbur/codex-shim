@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from urllib.request import urlopen
 
 
@@ -25,6 +26,7 @@ SERVICES = tuple(
 )
 
 _switch_lock = asyncio.Lock()
+_request_lock = asyncio.Lock()
 
 
 class LocalRuntimeError(RuntimeError):
@@ -91,6 +93,17 @@ async def _wait_ready(
         "Timed out waiting for requested llama-server "
         f"n_params={expected_params}"
     )
+
+
+@asynccontextmanager
+async def local_runtime_request(slug: str):
+    if slug not in PROFILES:
+        yield None
+        return
+
+    async with _request_lock:
+        runtime_alias = await ensure_local_runtime(slug)
+        yield runtime_alias
 
 
 async def ensure_local_runtime(slug: str) -> str | None:

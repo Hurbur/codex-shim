@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -230,3 +231,64 @@ async def test_wait_ready_rejects_identity_mismatch(monkeypatch):
             35505251456,
             timeout=1.0,
         )
+
+@pytest.mark.asyncio
+async def test_request_lease_blocks_cross_model_eviction(monkeypatch):
+    first_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+    second_acquired = asyncio.Event()
+
+    calls = []
+
+    async def fake_ensure(slug: str):
+        calls.append(slug)
+
+        if slug == "ornith":
+            return "ornith"
+
+        if slug == "ornith-1-5-9b":
+            return "slot1-ornith-1.5-9b"
+
+        return None
+
+    monkeypatch.setattr(
+        runtime,
+        "ensure_local_runtime",
+        fake_ensure,
+    )
+
+    async def first_request():
+        async with runtime.local_runtime_request(
+            "ornith"
+        ) as alias:
+            assert alias == "ornith"
+            first_acquired.set()
+            await release_first.wait()
+
+    async def second_request():
+        async with runtime.local_runtime_request(
+            "ornith-1-5-9b"
+        ) as alias:
+            assert alias == "slot1-ornith-1.5-9b"
+            second_acquired.set()
+
+    first = asyncio.create_task(first_request())
+
+    await first_acquired.wait()
+
+    second = asyncio.create_task(second_request())
+
+    await asyncio.sleep(0)
+
+    assert not second_acquired.is_set()
+    assert calls == ["ornith"]
+
+    release_first.set()
+
+    await asyncio.gather(first, second)
+
+    assert second_acquired.is_set()
+    assert calls == [
+        "ornith",
+        "ornith-1-5-9b",
+    ]
