@@ -64,6 +64,14 @@ def responses_to_chat(
     }
     _copy_if_present(body, chat, "temperature")
     _copy_if_present(body, chat, "top_p")
+    _copy_if_present(body, chat, "top_k")
+
+    # Gemma 4 vendor-recommended sampling. Explicit request values win.
+    if upstream_model == "slot2-gemma-4-26b":
+        chat.setdefault("temperature", 1.0)
+        chat.setdefault("top_p", 0.95)
+        chat.setdefault("top_k", 64)
+
     _copy_if_present(body, chat, "max_output_tokens", "max_tokens")
     _copy_if_present(body, chat, "max_tokens")
     if chat.get("max_tokens") is None and max_tokens is not None:
@@ -84,8 +92,8 @@ def responses_to_chat(
         effort = str(effort).lower()
         chat["reasoning_effort"] = effort
 
-        # Ornith does not natively support graded reasoning_effort, so map
-        # Codex effort levels to llama.cpp per-request thinking budgets.
+        # Local reasoning models use the shared Codex effort-to-budget map.
+        # llama.cpp receives the budget per request; services stay effort-agnostic.
         reasoning_budgets = {
             "none": 0,
             "minimal": 1024,
@@ -96,7 +104,14 @@ def responses_to_chat(
             "max": -1,
         }
 
-        if upstream_model == "ornith" and effort in reasoning_budgets:
+        local_budget_models = {
+            "ornith",
+            "slot1-ornith-1.5-9b",
+            "slot2-gemma-4-26b",
+            "slot4-agents-a1",
+        }
+
+        if upstream_model in local_budget_models and effort in reasoning_budgets:
             chat["thinking_budget_tokens"] = reasoning_budgets[effort]
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))

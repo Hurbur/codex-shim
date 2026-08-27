@@ -637,3 +637,65 @@ def test_responses_to_chat_keeps_legacy_top_level_reasoning_effort_for_ornith():
 
     assert out["reasoning_effort"] == "low"
     assert out["thinking_budget_tokens"] == 2048
+
+def test_responses_to_chat_maps_gemma_reasoning_effort_to_budget():
+    from codex_shim.translate import responses_to_chat
+
+    budgets = {
+        "none": 0,
+        "minimal": 1024,
+        "low": 2048,
+        "medium": 6114,
+        "high": 16384,
+        "xhigh": 32768,
+        "max": -1,
+    }
+
+    for effort, expected in budgets.items():
+        out = responses_to_chat(
+            {
+                "input": "test",
+                "reasoning": {"effort": effort},
+            },
+            "slot2-gemma-4-26b",
+        )
+
+        assert out["reasoning_effort"] == effort
+        assert out["thinking_budget_tokens"] == expected
+
+
+def test_responses_to_chat_applies_gemma_sampling_defaults():
+    from codex_shim.translate import responses_to_chat
+
+    out = responses_to_chat(
+        {
+            "input": "test",
+            "reasoning": {"effort": "medium"},
+        },
+        "slot2-gemma-4-26b",
+    )
+
+    assert out["temperature"] == 1.0
+    assert out["top_p"] == 0.95
+    assert out["top_k"] == 64
+    assert out["thinking_budget_tokens"] == 6114
+
+
+def test_responses_to_chat_gemma_explicit_sampling_wins():
+    from codex_shim.translate import responses_to_chat
+
+    out = responses_to_chat(
+        {
+            "input": "test",
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 32,
+            "reasoning": {"effort": "high"},
+        },
+        "slot2-gemma-4-26b",
+    )
+
+    assert out["temperature"] == 0.7
+    assert out["top_p"] == 0.8
+    assert out["top_k"] == 32
+    assert out["thinking_budget_tokens"] == 16384

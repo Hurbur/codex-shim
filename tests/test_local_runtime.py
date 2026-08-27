@@ -64,6 +64,8 @@ async def test_none_to_9b_stops_both_then_starts_9b(monkeypatch):
     assert calls == [
         ("stop", "ornith-llama.service"),
         ("stop", "ornith-9b.service"),
+        ("stop", "gemma-4-26b.service"),
+        ("stop", "agents-a1.service"),
         ("start", "ornith-9b.service"),
     ]
 
@@ -104,6 +106,8 @@ async def test_9b_to_35b_stops_both_then_starts_35b(monkeypatch):
     assert calls == [
         ("stop", "ornith-llama.service"),
         ("stop", "ornith-9b.service"),
+        ("stop", "gemma-4-26b.service"),
+        ("stop", "agents-a1.service"),
         ("start", "ornith-llama.service"),
     ]
 
@@ -149,6 +153,8 @@ async def test_start_failure_raises_local_runtime_error(monkeypatch):
     assert calls == [
         ("stop", "ornith-llama.service"),
         ("stop", "ornith-9b.service"),
+        ("stop", "gemma-4-26b.service"),
+        ("stop", "agents-a1.service"),
         ("start", "ornith-9b.service"),
     ]
 
@@ -292,3 +298,136 @@ async def test_request_lease_blocks_cross_model_eviction(monkeypatch):
         "ornith",
         "ornith-1-5-9b",
     ]
+
+@pytest.mark.asyncio
+async def test_none_to_gemma_stops_all_then_starts_gemma(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        runtime,
+        "_runtime_info",
+        lambda: None,
+    )
+
+    async def fake_systemctl(*args: str):
+        calls.append(args)
+        return 0, ""
+
+    async def fake_wait_ready(expected_params: int):
+        assert expected_params == 25233142046
+        return {
+            "id": "slot2-gemma-4-26b",
+            "n_params": 25233142046,
+            "n_ctx": 65536,
+        }
+
+    monkeypatch.setattr(runtime, "_systemctl", fake_systemctl)
+    monkeypatch.setattr(runtime, "_wait_ready", fake_wait_ready)
+
+    result = await runtime.ensure_local_runtime("gemma-4-26b")
+
+    assert result == "slot2-gemma-4-26b"
+
+    assert calls == [
+        ("stop", "ornith-llama.service"),
+        ("stop", "ornith-9b.service"),
+        ("stop", "gemma-4-26b.service"),
+        ("stop", "agents-a1.service"),
+        ("start", "gemma-4-26b.service"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gemma_same_model_is_noop(monkeypatch):
+    monkeypatch.setattr(
+        runtime,
+        "_runtime_info",
+        lambda: {
+            "id": "slot2-gemma-4-26b",
+            "n_params": 25233142046,
+            "n_ctx": 65536,
+        },
+    )
+
+    async def forbidden_systemctl(*_args: str):
+        raise AssertionError(
+            "same-model Gemma request must not touch systemd"
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "_systemctl",
+        forbidden_systemctl,
+    )
+
+    result = await runtime.ensure_local_runtime("gemma-4-26b")
+
+    assert result == "slot2-gemma-4-26b"
+
+
+@pytest.mark.asyncio
+async def test_none_to_agents_a1_stops_all_then_starts_agents_a1(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        runtime,
+        "_runtime_info",
+        lambda: None,
+    )
+
+    async def fake_systemctl(*args: str):
+        calls.append(args)
+        return 0, ""
+
+    async def fake_wait_ready(expected_params: int):
+        assert expected_params == 34660610688
+        return {
+            "id": "slot4-agents-a1",
+            "n_params": 34660610688,
+            "n_ctx": 65536,
+        }
+
+    monkeypatch.setattr(runtime, "_systemctl", fake_systemctl)
+    monkeypatch.setattr(runtime, "_wait_ready", fake_wait_ready)
+
+    result = await runtime.ensure_local_runtime("agents-a1")
+
+    assert result == "slot4-agents-a1"
+
+    assert calls == [
+        ("stop", "ornith-llama.service"),
+        ("stop", "ornith-9b.service"),
+        ("stop", "gemma-4-26b.service"),
+        ("stop", "agents-a1.service"),
+        ("start", "agents-a1.service"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agents_a1_same_model_is_noop(monkeypatch):
+    monkeypatch.setattr(
+        runtime,
+        "_runtime_info",
+        lambda: {
+            "id": "slot4-agents-a1",
+            "n_params": 34660610688,
+            "n_ctx": 65536,
+        },
+    )
+
+    async def forbidden_systemctl(*args: str):
+        raise AssertionError(
+            f"systemctl must not run for same-model no-op: {args}"
+        )
+
+    async def forbidden_wait_ready(_expected_params: int):
+        raise AssertionError(
+            "_wait_ready must not run for same-model no-op"
+        )
+
+    monkeypatch.setattr(runtime, "_systemctl", forbidden_systemctl)
+    monkeypatch.setattr(runtime, "_wait_ready", forbidden_wait_ready)
+
+    result = await runtime.ensure_local_runtime("agents-a1")
+
+    assert result == "slot4-agents-a1"

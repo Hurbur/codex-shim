@@ -18,6 +18,16 @@ PROFILES = {
         "alias": "slot1-ornith-1.5-9b",
         "n_params": 8953803264,
     },
+    "gemma-4-26b": {
+        "service": "gemma-4-26b.service",
+        "alias": "slot2-gemma-4-26b",
+        "n_params": 25233142046,
+    },
+    "agents-a1": {
+        "service": "agents-a1.service",
+        "alias": "slot4-agents-a1",
+        "n_params": 34660610688,
+    },
 }
 
 SERVICES = tuple(
