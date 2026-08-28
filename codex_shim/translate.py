@@ -109,6 +109,8 @@ def responses_to_chat(
             "slot1-ornith-1.5-9b",
             "slot2-gemma-4-26b",
             "slot4-agents-a1",
+            "qwen3.8",
+            "slot5-qwen3.8",
         }
 
         if upstream_model in local_budget_models and effort in reasoning_budgets:

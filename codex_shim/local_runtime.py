@@ -28,6 +28,11 @@ PROFILES = {
         "alias": "slot4-agents-a1",
         "n_params": 34660610688,
     },
+    "qwen3-8": {
+        "service": "qwen3.8.service",
+        "alias": "slot5-qwen3.8",
+        "n_params": 27320697856,
+    },
 }
 
 SERVICES = tuple(

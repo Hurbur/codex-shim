@@ -699,3 +699,34 @@ def test_responses_to_chat_gemma_explicit_sampling_wins():
     assert out["top_p"] == 0.8
     assert out["top_k"] == 32
     assert out["thinking_budget_tokens"] == 16384
+
+
+def test_qwen38_reasoning_effort_maps_to_budget():
+    from codex_shim.translate import responses_to_chat
+
+    expected = {
+        "low": 2048,
+        "medium": 6114,
+        "high": 16384,
+        "xhigh": 32768,
+    }
+
+    for upstream_model in ("qwen3.8", "slot5-qwen3.8"):
+        for effort, budget in expected.items():
+            result = responses_to_chat(
+                {
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": "test",
+                        }
+                    ],
+                    "reasoning": {
+                        "effort": effort,
+                    },
+                },
+                upstream_model,
+                40960,
+            )
+
+            assert result["thinking_budget_tokens"] == budget
